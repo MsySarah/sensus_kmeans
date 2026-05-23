@@ -16,9 +16,11 @@ class TelegramController extends Controller
 
     public function webhook(Request $request)
     {
+        $chatId = null; // Set default agar catch block aman
         try {
             $update = $request->all();
 
+            // --- PILIHAN TOMBOL (CALLBACK QUERY) ---
             if (isset($update['callback_query'])) {
                 $callback = $update['callback_query'];
                 $chatId = $callback['message']['chat']['id'];
@@ -34,13 +36,21 @@ class TelegramController extends Controller
                     return $this->sendMessage($chatId, $msg);
                 }
 
-                // KLIK TOMBOL KENDALA INSTAN
+                // KLIK TOMBOL KENDALA
                 if (str_starts_with($data, 'btnK-')) {
                     $cb_parts = explode('-', $data);
                     $id_sls = $cb_parts[1];
-                    $bobotBaru = $cb_parts[2];
-                    $idx = $cb_parts[3];
+                    $opsi_pilihan = $cb_parts[2];
 
+                    // REVISI: Jika memilih opsi "Lainnya" (Ketik Manual)
+                    if ($opsi_pilihan === 'lainnya') {
+                        $msg = "📝 *INPUT KENDALA MANUAL*\n\nSilakan ketik langsung kendala Anda dengan format di bawah ini:\n\n`K-{$id_sls}-Isi kendala lapangan secara detail`";
+                        return $this->sendMessage($chatId, $msg);
+                    }
+
+                    // Jika memilih opsi template bawaan (B1/B2/B3)
+                    $bobotBaru = $opsi_pilihan;
+                    $idx = $cb_parts[3];
                     $alasanBaru = $this->alasan_templates[$bobotBaru][$idx] ?? 'Kendala Lainnya';
                     
                     $wilayah = DB::table('wilayahs')->where('id_sub_sls', $id_sls)->first();
@@ -72,6 +82,7 @@ class TelegramController extends Controller
                 return response()->json(['status' => 'ok']);
             }
 
+            // --- INPUT TEKS MANUAL DARI CHAT ---
             if (isset($update['message']['text'])) {
                 $chatId = $update['message']['chat']['id'];
                 $text = trim($update['message']['text']);
@@ -100,31 +111,57 @@ class TelegramController extends Controller
 
                 $lokasi = "📍 *Wilayah:* {$wilayah->nama_kab}, Kec. {$wilayah->nama_kec}, {$wilayah->nama_sls}";
 
-                // --- LOGIKA KENDALA ---
+                // --- LOGIKA KENDALA (K) ---
                 if ($tipe === 'K') {
+                    
+                    // REVISI: Jika PCL mengetik teks kendala secara manual (Contoh: K-160105...-Isi Kendala)
                     if (count($parts) > 2) {
-                        return $this->sendMessage($chatId, "❌ *Format Kendala Salah*\nCukup ketik `K-{$id_sls}` saja.");
+                        $teksManual = trim(implode('-', array_slice($parts, 2)));
+
+                        if (empty($teksManual)) {
+                            return $this->sendMessage($chatId, "❌ *Isi Kendala Kosong*\nSilakan ketik rincian kendala Anda setelah ID SLS.");
+                        }
+
+                        $waktuLapor = now()->format('d/m H:i'); 
+                        $teksBaru = "[$waktuLapor] B0 (Manual): {$teksManual}";
+                        $keteranganGabungan = $wilayah->keterangan_kendala 
+                            ? $wilayah->keterangan_kendala . "\n" . $teksBaru 
+                            : $teksBaru;
+
+                        // Simpan teks manual ke database, tapi set bobot = 0 (B0) sesuai instruksi BPS
+                        DB::table('wilayahs')->where('id_sub_sls', $id_sls)->update([
+                            'bobot_kendala' => 0, 
+                            'keterangan_kendala' => $keteranganGabungan,
+                            'updated_at' => now()
+                        ]);
+
+                        return $this->sendMessage($chatId, "✅ *LAPORAN KENDALA MANUAL DITERIMA*\n{$lokasi}\n📝 *Kendala:* {$teksManual}\n\n⏳ _Laporan disimpan. Menunggu pemeriksaan dan penentuan bobot oleh Petugas Pengawas via Web Dashboard._");
                     }
 
+                    // JIKA HANYA MENGETIK K-IDSLS (Munculkan tombol pilihan + opsi Lainnya)
                     $keyboard = ['inline_keyboard' => []];
                     foreach ($this->alasan_templates as $bobot => $list_alasan) {
                         foreach ($list_alasan as $idx => $teks_alasan) {
-                                $keyboard['inline_keyboard'][] = [
-                                    ['text' => "[B{$bobot}] {$teks_alasan}", 'callback_data' => "btnK-{$id_sls}-{$bobot}-{$idx}"]
-                                ];
+                            $keyboard['inline_keyboard'][] = [
+                                ['text' => "[B{$bobot}] {$teks_alasan}", 'callback_data' => "btnK-{$id_sls}-{$bobot}-{$idx}"]
+                            ];
                         }
-                        if (!empty($row)) { $keyboard['inline_keyboard'][] = $row; }
                     }
+                    
+                    // REVISI: Tambahkan Opsi Tombol Manual "Lainnya" di baris paling bawah
+                    $keyboard['inline_keyboard'][] = [
+                        ['text' => "📝 Kendala Lainnya (Ketik Manual)", 'callback_data' => "btnK-{$id_sls}-lainnya"]
+                    ];
                     
                     return $this->sendRequest('sendMessage', [
                         'chat_id' => $chatId,
-                        'text' => "⚠️ *PILIH KENDALA UNTUK SLS INI*\n{$lokasi}\n\nSilakan klik tombol di bawah:",
+                        'text' => "⚠️ *PILIH KENDALA UNTUK SLS INI*\n{$lokasi}\n\nSilakan klik salah satu tombol di bawah atau pilih Ketik Manual:",
                         'reply_markup' => json_encode($keyboard),
                         'parse_mode' => 'Markdown'
                     ]);
                 }
                 
-                // --- LOGIKA PROGRES
+                // --- LOGIKA PROGRES (P) ---
                 else if ($tipe === 'P') {
                     if (count($parts) !== 4) {
                         return $this->sendMessage($chatId, "❌ *Format Progres Salah*\nFormat: `P-ID-Selesai-Diperiksa`.");
@@ -140,7 +177,6 @@ class TelegramController extends Controller
                     $selesai = (int) $selesai_raw;
                     $diperiksa = (int) $diperiksa_raw;
 
-                    // VALIDASI AGAR TIDAK MELEBIHI MUATAN
                     if ($selesai > $wilayah->muatan || $diperiksa > $wilayah->muatan) {
                         return $this->sendMessage($chatId, "❌ *Angka Melebihi Target*\nJumlah Selesai ({$selesai}) atau Diperiksa ({$diperiksa}) tidak boleh melebihi total muatan wilayah ({$wilayah->muatan}).\n\nMohon periksa kembali data Anda.");
                     }
@@ -156,7 +192,9 @@ class TelegramController extends Controller
             }
 
         } catch (\Exception $e) {
-            return $this->sendMessage($chatId, "⚠️ *Gangguan:* " . $e->getMessage());
+            if ($chatId) {
+                return $this->sendMessage($chatId, "⚠️ *Gangguan:* " . $e->getMessage());
+            }
         }
         return response()->json(['status' => 'ok']);
     }

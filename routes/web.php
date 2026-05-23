@@ -19,7 +19,7 @@ Route::get('/login', [LoginController::class, 'showLoginForm'])->name('login')->
 Route::post('/login', [LoginController::class, 'authenticate']);
 Route::post('/logout', [LoginController::class, 'logout'])->name('logout');
 
-// Bot
+// Bot Telegram Webhook
 Route::post('/bot-sensus', [TelegramController::class, 'webhook'])
     ->withoutMiddleware([\Illuminate\Foundation\Http\Middleware\ValidateCsrfToken::class]);
 
@@ -52,23 +52,26 @@ Route::get('/get-sls/{id_desa}', function($id_desa) {
             ->get();
 });
 
+// --- ROUTE WAJIB LOGIN AUTH ---
 Route::middleware(['auth'])->group(function () {
-    // Rute Dashboard (sudah ada)
+    // Rute Dashboard Utama
     Route::get('/dashboard', [DashboardController::class, 'index'])->name('dashboard');
+    
+    // REVISI BPS: Rute Verifikasi Skala Bobot Kendala Manual oleh Pengawas (PML/Koseka)
+    Route::post('/kendala/verifikasi/{id}', [DashboardController::class, 'verifikasiBobotManual'])->name('kendala.verifikasi');
     
     // Rute CRUD User (Hanya Admin yang bisa akses)
     Route::resource('admin/users', UserController::class);
 });
 
-
 Route::get('/hasil-klaster', [KlasterController::class, 'index'])->name('hasil.klaster');
 
-
+// Grup Master Data
 Route::prefix('admin/master')->group(function () {
     Route::get('/dataset', [MasterDataController::class, 'dataset'])->name('master.dataset');
     Route::get('/wilayah', [MasterDataController::class, 'wilayah'])->name('master.wilayah');
     Route::get('/kendala', [MasterDataController::class, 'kendala'])->name('master.kendala');
 });
 
-// Route Atasi Kendala
-Route::patch('/kendala/selesai/{id}', [App\Http\Controllers\DashboardController::class, 'selesaikanKendala'])->name('kendala.selesai');
+// Route Atasi Kendala (Centang ✅ Log)
+Route::patch('/kendala/selesai/{id}', [DashboardController::class, 'selesaikanKendala'])->name('kendala.selesai');

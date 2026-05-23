@@ -44,9 +44,9 @@ class DashboardController extends Controller
             $cari     = trim($request->search);
             $cariLow  = strtolower($cari);
             $isAngka  = is_numeric($cari);
-         
+          
             $query->where(function ($q) use ($cari, $cariLow, $isAngka) {
-         
+          
                 // 1. Cari nama SLS langsung (contoh: "RT 01 DUSUN 02")
                 $q->where('nama_sls', 'LIKE', "%{$cari}%")
                   ->orWhere('nama_desa',  'LIKE', "%{$cari}%")
@@ -54,17 +54,17 @@ class DashboardController extends Controller
                   ->orWhere('nama_kab',   'LIKE', "%{$cari}%")
                   ->orWhere('id_sub_sls', 'LIKE', "%{$cari}%")
                   ->orWhere('cluster_label', 'LIKE', "%{$cari}%");
-         
+          
                 // 2. FIX: Normalize angka — "RT 1" juga bisa ketemu "RT 01"
                 $cariNormalized = preg_replace_callback('/\b(\d+)\b/', function ($m) {
                     // Pad angka 1 digit jadi 2 digit (1->01, 2->02, dst)
                     return strlen($m[1]) === 1 ? str_pad($m[1], 2, '0', STR_PAD_LEFT) : $m[1];
                 }, $cari);
-         
+          
                 if ($cariNormalized !== $cari) {
                     $q->orWhere('nama_sls', 'LIKE', "%{$cariNormalized}%");
                 }
-         
+          
                 // input (RT 01 -> cari juga RT 1)
                 $cariStripped = preg_replace('/\b0+(\d)/', '$1', $cari);
                 if ($cariStripped !== $cari) {
@@ -73,18 +73,15 @@ class DashboardController extends Controller
                 if ($isAngka) {
                     $angka        = (int) $cari;
                     $angkaPadded  = str_pad($angka, 2, '0', STR_PAD_LEFT); // 1 → "01", 2 → "02"
-         
+          
                     // Cari nama SLS yang mengandung angka
                     $q->orWhere('nama_sls', 'LIKE', "%{$angka}%")
                       ->orWhere('nama_sls', 'LIKE', "%{$angkaPadded}%");
                 }
-        
-         
-                
             });
         }
             
-        //HITUNG STATS BERDASARKAN WILAYAH ---
+        // HITUNG STATS BERDASARKAN WILAYAH ---
         $dataSesuaiWilayah = $query->get();
         
         $totalSelesai   = $dataSesuaiWilayah->sum('selesai');
@@ -94,17 +91,24 @@ class DashboardController extends Controller
         $totalWaspada    = $dataSesuaiWilayah->where('cluster_label', 'Waspada')->count();
         $totalTerkendala = $dataSesuaiWilayah->where('cluster_label', 'Terkendala')->count();
 
-        // Hitung Detail Kendala
+        // Hitung Detail Kendala Berbobot
         $countRingan = $dataSesuaiWilayah->where('bobot_kendala', 1)->count();
         $countSedang = $dataSesuaiWilayah->where('bobot_kendala', 2)->count();
         $countBerat  = $dataSesuaiWilayah->where('bobot_kendala', '>=', 3)->count();
+        
+        // REVISI: Hitung Jumlah Kendala Manual yang BELUM Diverifikasi (Bobotnya masih 0 tapi teks ada)
+        $countBelumVerifikasi = $dataSesuaiWilayah->where('bobot_kendala', 0)
+            ->whereNotNull('keterangan_kendala')
+            ->filter(function($item) {
+                return trim($item->keterangan_kendala) !== '' && str_contains($item->keterangan_kendala, 'B0 (Manual)');
+            })->count();
     
         // 3. Filter Tabel berdasarkan Klaster
         if ($request->filled('cluster')) {
             $query->where('cluster_label', $request->cluster);
         }
 
-        // Filter Berdasarkan Bobot (Jika rincian di kotak merah diklik)
+        // Filter Berdasarkan Bobot (Jika rincian di kotak indikator diklik)
         if ($request->filled('bobot')) {
             $query->where('bobot_kendala', $request->bobot);
         }
@@ -116,6 +120,13 @@ class DashboardController extends Controller
             } elseif ($request->status_progres == '0') {
                 $query->where('selesai', 0)->where('muatan', '>', 0);
             }
+        }
+
+        // REVISI UTAMA: Menyaring baris data tabel agar hanya menampilkan kendala manual B0 yang belum diverifikasi
+        if ($request->filled('belum_verifikasi') && $request->belum_verifikasi == '1') {
+            $query->where('wilayahs.bobot_kendala', 0)
+                  ->whereNotNull('wilayahs.keterangan_kendala')
+                  ->where('wilayahs.keterangan_kendala', 'LIKE', '%B0 (Manual)%');
         }
     
         $persentaseTotal = ($totalMuatan > 0) ? round(($totalSelesai / $totalMuatan) * 100, 1) : 0;
@@ -138,8 +149,51 @@ class DashboardController extends Controller
             'wilayahs', 'listKab', 'listKec', 'totalSelesai', 'totalDiperiksa', 
             'totalMuatan', 'persentaseTotal', 'totalLancar', 'totalWaspada', 
             'totalTerkendala', 'waktuUpdate','waktuLaporan', 'waktuAI',
-            'countRingan', 'countSedang', 'countBerat'
+            'countRingan', 'countSedang', 'countBerat', 'countBelumVerifikasi'
         ));
+    }
+
+    // --- REVISI BPS: FUNGSI UNTUK VERIFIKASI BOBOT KENDALA MANUAL OLEH PENGAWAS ---
+    public function verifikasiBobotManual(Request $request, $id)
+    {
+        $data = DB::table('wilayahs')->where('id_sub_sls', $id)->first();
+        if (!$data) return back()->with('error', 'Data SLS tidak ditemukan.');
+
+        $request->validate([
+            'bobot_pilihan' => 'required|in:1,2,3'
+        ]);
+
+        $bobotPilihan = (int) $request->bobot_pilihan; // Ambil nilai angka 1, 2, atau 3
+
+        // Ganti label string teks 'B0 (Manual)' menjadi 'B1', 'B2', atau 'B3' sesuai keputusan Pengawas BPS
+        $keteranganEksisting = $data->keterangan_kendala;
+        $keteranganBaru = str_replace('B0 (Manual)', 'B' . $bobotPilihan, $keteranganEksisting);
+
+        // Hitung ulang penentuan label Klaster Sementara (sebelum tombol Klaster AI memproses ulang)
+        $labelBaru = 'Lancar';
+        if ($bobotPilihan >= 3) {
+            $labelBaru = 'Terkendala';
+        } elseif ($bobotPilihan == 2 || $bobotPilihan == 1) {
+            $labelBaru = 'Waspada';
+        }
+
+        $payload = [
+            'keterangan_kendala' => $keteranganBaru,
+            'bobot_kendala' => $bobotPilihan,
+            'cluster_label' => $labelBaru,
+            'updated_at' => now()
+        ];
+
+        // Update ke tabel utama wilayahs
+        DB::table('wilayahs')->where('id_sub_sls', $id)->update($payload);
+        
+        // Sinkronkan ke tabel history harian biar grafik data time-series tidak galat
+        DB::table('history_kendala')
+            ->where('id_sub_sls', $id)
+            ->where('tanggal_catat', date('Y-m-d'))
+            ->update($payload);
+
+        return back()->with('success', 'Kendala manual berhasil diverifikasi menjadi Bobot ' . $bobotPilihan . '!');
     }
 
     public function selesaikanKendala(Request $request, $id)
@@ -177,14 +231,14 @@ class DashboardController extends Controller
         // 3. Tentukan Label Klaster berdasarkan bobot baru
         $labelBaru = 'Lancar';
         if ($bobotBaru >= 3) $labelBaru = 'Terkendala';
-        elseif ($bobotBaru == 2) $labelBaru = 'Waspada';
-        elseif ($bobotBaru == 1) $labelBaru = 'Waspada'; // Atau sesuaikan keinginanmu
+        elseif ($bobotBaru == 2 || $bobotBaru == 1) $labelBaru = 'Waspada';
 
         // 4. Update ke Database
         $payload = [
             'keterangan_kendala' => $keteranganBaru,
             'bobot_kendala' => $bobotBaru,
-            'cluster_label' => $labelBaru
+            'cluster_label' => $labelBaru,
+            'updated_at' => now()
         ];
 
         DB::table('wilayahs')->where('id_sub_sls', $id)->update($payload);
@@ -196,5 +250,5 @@ class DashboardController extends Controller
             ->update($payload);
 
         return back()->with('success', 'Bobot berhasil diupdate secara otomatis!')->with('open_modal', $id);
-}
+    }
 }
